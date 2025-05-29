@@ -18,8 +18,9 @@ add_mlir_dialect_library(MLIRTTIRTransforms
         Quantization.cpp
         Transforms.cpp
         TTIRFusing.cpp
-
-        ADDITIONAL_HEADER_DIRS
+        Sparse.cpp
+        SparseLowering.cpp        
+        SparsityProfiling.cpp
         ${PROJECT_SOURCE_DIR}/include/ttmlir
 
         DEPENDS

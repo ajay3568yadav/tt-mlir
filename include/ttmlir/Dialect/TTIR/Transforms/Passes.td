@@ -519,4 +519,69 @@ def TTIRFusing: Pass<"ttir-fusing", "::mlir::ModuleOp">
   let description = "This pass tries to fuse operations together with goal to reduce the number of operations in the graph.";
 }
 
+def TTIRSparseTransform : Pass<"ttir-sparse-transform", "::mlir::ModuleOp"> {
+  let summary = "Transform dense matrix operations to leverage sparse acceleration";
+  let description = [{
+    This pass identifies dense matrix operations (like linalg.matmul) that can
+    benefit from sparse acceleration and transforms them to use Tenstorrent's
+    hardware sparse units.
+
+    The pass supports:
+    - 2:4 structured sparsity (2 non-zero values per 4 elements)
+    - Unstructured sparsity patterns
+    - Automatic mode selection based on tensor analysis
+
+    Example:
+    ```mlir
+    // Before
+    %result = linalg.matmul ins(%a, %b : tensor<128x64xf32>, tensor<64x32xf32>)
+                           outs(%c : tensor<128x32xf32>) -> tensor<128x32xf32>
+
+    // After (with sparse attributes)
+    %result = linalg.matmul {tt.sparse_mode = "2:4", tt.sparse_threshold = 0.5 : f32}
+                           ins(%a, %b : tensor<128x64xf32>, tensor<64x32xf32>)
+                           outs(%c : tensor<128x32xf32>) -> tensor<128x32xf32>
+    ```
+  }];
+
+  let options = [
+    Option<"mode", "mode", "std::string", /*default=*/"\"auto\"",
+           "Sparsity mode: auto, structured-2-4, or unstructured">,
+    Option<"sparsityThreshold", "sparsity-threshold", "float", /*default=*/"0.5f",
+           "Minimum sparsity ratio to trigger transformation">,
+    Option<"enableProfiling", "enable-profiling", "bool", /*default=*/"false",
+           "Enable profiling of sparse operations">
+  ];
+
+  let dependentDialects = [
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect",
+    "mlir::arith::ArithDialect",
+    "mlir::tt::TTDialect",
+    "mlir::tt::ttir::TTIRDialect"
+  ];
+}
+
+def TTIRLowerSparseOps : Pass<"ttir-lower-sparse-ops", "::mlir::ModuleOp"> {
+  let summary = "Lower sparse-annotated operations to hardware sparse operations";
+  let description = [{
+    This pass lowers operations that have been annotated with sparse attributes
+    (by the ttir-sparse-transform pass) into hardware-specific sparse operations.
+    
+    It converts:
+    - linalg.matmul with sparse attributes -> ttmetal.sparse_matmul (or equivalent)
+    
+    The pass handles:
+    - Propagating mask metadata
+    - Converting attributes to operation parameters
+    - Ensuring correct data layout for hardware sparse units
+  }];
+
+  let dependentDialects = [
+    "mlir::linalg::LinalgDialect",
+    "mlir::tt::TTDialect",
+    "mlir::tt::ttir::TTIRDialect"
+  ];
+}
+
 #endif
