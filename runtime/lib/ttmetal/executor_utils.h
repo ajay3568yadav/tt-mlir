@@ -168,8 +168,7 @@ inline std::string kernelConfigTypeString(
                    std::underlying_type_t<tt_metal::DataMovementProcessor>>(
                    dataMovementConfig->processor)) +
            "_noc" + std::to_string(dataMovementConfig->noc);
-  } else if (const auto *computeConfig =
-                 std::get_if<tt_metal::ComputeConfig>(&kernelConfig)) {
+  } else if (std::holds_alternative<tt_metal::ComputeConfig>(kernelConfig)) {
     return "compute";
   } else if (const auto *ethernetConfig =
                  std::get_if<tt_metal::EthernetConfig>(&kernelConfig)) {
@@ -218,7 +217,7 @@ inline std::string coreRangeToString(const CoreRangeSet &coreRanges) {
 }
 
 inline std::string createKernelFilePath(
-    const char *currentProgramName, const char *programDebugInfo,
+    const char *currentProgramName, const char *kernelDebugInfo,
     const CoreRangeSet &coreRangeSet,
     const std::variant<tt_metal::DataMovementConfig, tt_metal::ComputeConfig,
                        tt_metal::EthernetConfig> &kernelConfig,
@@ -226,7 +225,7 @@ inline std::string createKernelFilePath(
   std::string path(prefix);
   path += currentProgramName;
   path += "_";
-  path += parseLocFromDebugInfo(programDebugInfo);
+  path += kernelDebugInfo;
   path += "_";
   path += kernelConfigTypeString(kernelConfig);
 
@@ -263,7 +262,7 @@ inline tt_metal::KernelHandle createKernel(
                               debug::Env::get().loadKernelsFromDisk;
   std::string fileName;
   if (kernelFromFile) {
-    fileName = createKernelFilePath(currentProgramName, programDebugInfo,
+    fileName = createKernelFilePath(currentProgramName, kernelDebugInfo,
                                     coreRangeSet, kernelConfig);
     writeFile(fileName, kernelSource);
   }

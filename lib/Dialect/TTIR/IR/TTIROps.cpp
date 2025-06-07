@@ -369,7 +369,7 @@ mlir::LogicalResult mlir::tt::ttir::ConstantOp::bufferize(
     const mlir::bufferization::BufferizationOptions &options) {
   ::llvm::SmallVector<mlir::Value> invocationStack;
   auto memrefType = mlir::cast<mlir::MemRefType>(
-      *getBufferType(getResult(), options, invocationStack));
+      getBufferType(getResult(), options, invocationStack).value());
 
   mlir::memref::GlobalOp global = createGlobal(
       getOperation()->getParentOfType<ModuleOp>(), memrefType, getValue());
@@ -633,10 +633,24 @@ bool mlir::tt::ttir::Conv2dOp::isBiasCompatible(llvm::ArrayRef<int64_t> bias) {
 // Quantize ops
 //===----------------------------------------------------------------------===//
 
+// Helper function to verify that a zero point is within the range of the
+// storage type.
+static ::mlir::LogicalResult verifyZeroPointInRange(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitOpError,
+    int64_t zeroPoint, int64_t min, int64_t max, mlir::Type storageType) {
+  if (zeroPoint < min || zeroPoint > max) {
+    return emitOpError() << "Zero point " << zeroPoint
+                         << " is out of the range for storage type "
+                         << storageType;
+  }
+  return ::mlir::success();
+}
+
 // Common verifier for all Quantize ops.
 static ::mlir::LogicalResult verifyQuantizeOpCommon(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitOpError,
-    ::mlir::RankedTensorType inputType, ::mlir::RankedTensorType outputType) {
+    ::mlir::RankedTensorType inputType, ::mlir::RankedTensorType outputType,
+    std::optional<uint32_t> axis = std::nullopt, bool isUnrolled = false) {
   // Sanity check to make sure that input rank matches the rank of the output
   // tensor.
   if (inputType.getRank() != outputType.getRank()) {
@@ -652,6 +666,62 @@ static ::mlir::LogicalResult verifyQuantizeOpCommon(
                                 ") must match the inferred shape: (" +
                                 ttmlir::utils::join(inputType.getShape(), ",") +
                                 ")";
+  }
+
+  if (!isUnrolled) {
+    return ::mlir::success();
+  }
+
+  if (axis.has_value()) {
+    int32_t axisValue = axis.value();
+    if (axisValue < 0 || axisValue >= inputType.getRank()) {
+      return emitOpError() << "Axis value " << axisValue
+                           << " is out of the range [0, " << inputType.getRank()
+                           << ") for the input tensor of rank "
+                           << inputType.getRank();
+    }
+  }
+  for (auto tensorType : {inputType, outputType}) {
+    auto elemType = tensorType.getElementType();
+    if (auto quantPerAxisType =
+            mlir::dyn_cast<mlir::quant::UniformQuantizedPerAxisType>(
+                elemType)) {
+      // Verify that the scales size matches the axis size for per-axis
+      // quantization on both input and output types. This aligns with the
+      // runtime's behavior.
+      int64_t axis = quantPerAxisType.getQuantizedDimension();
+      auto shape = tensorType.getShape();
+      auto scales = quantPerAxisType.getScales();
+      if (scales.size() != static_cast<size_t>(shape[axis])) {
+        return emitOpError()
+               << "Number of scales (" << scales.size()
+               << ") does not match the size of the quantized axis ("
+               << shape[axis] << ")";
+      }
+      // Verify that the zero point is in the range of the storage type.
+      // This aligns with the frontends' behavior.
+      llvm::ArrayRef<int64_t> zeroPoints = quantPerAxisType.getZeroPoints();
+      int64_t min = quantPerAxisType.getStorageTypeMin();
+      int64_t max = quantPerAxisType.getStorageTypeMax();
+      for (int64_t curZeroPoint : zeroPoints) {
+        if (auto result =
+                verifyZeroPointInRange(emitOpError, curZeroPoint, min, max,
+                                       quantPerAxisType.getStorageType());
+            failed(result)) {
+          return result;
+        }
+      }
+    }
+    if (auto quantType =
+            mlir::dyn_cast<mlir::quant::UniformQuantizedType>(elemType)) {
+      // Verify that the zero point is in the range of the storage type
+      // (per-tensor). This aligns with the frontends' behavior.
+      int64_t curZeroPoint = quantType.getZeroPoint();
+      int64_t min = quantType.getStorageTypeMin();
+      int64_t max = quantType.getStorageTypeMax();
+      return verifyZeroPointInRange(emitOpError, curZeroPoint, min, max,
+                                    quantType.getStorageType());
+    }
   }
 
   return ::mlir::success();
@@ -676,7 +746,31 @@ static ::mlir::LogicalResult verifyQuantizeOpCommon(
   }
 
   return verifyQuantizeOpCommon([&]() { return emitOpError(); },
-                                getInput().getType(), getOutput().getType());
+                                getInput().getType(), getOutput().getType(),
+                                /*axis=*/std::nullopt, /*isUnrolled=*/false);
+}
+
+// QuantizeUnrolledOp verification.
+::mlir::LogicalResult mlir::tt::ttir::QuantizeUnrolledOp::verify() {
+  auto inputElemType = getInput().getType().getElementType();
+  auto outputElemType = getResult().getType().getElementType();
+
+  if (!mlir::isa<mlir::FloatType>(inputElemType)) {
+    return emitOpError() << "Input element type must be float, but got "
+                         << inputElemType;
+  }
+
+  if (!mlir::isa<mlir::quant::UniformQuantizedType,
+                 mlir::quant::UniformQuantizedPerAxisType>(outputElemType)) {
+    return emitOpError()
+           << "Output element type must be UniformQuantizedType or "
+              "UniformQuantizedPerAxisType, but got "
+           << outputElemType;
+  }
+
+  return verifyQuantizeOpCommon([&]() { return emitOpError(); },
+                                getInput().getType(), getOutput().getType(),
+                                getAxis(), /*isUnrolled=*/true);
 }
 
 // DequantizeOp verification.
@@ -697,7 +791,33 @@ static ::mlir::LogicalResult verifyQuantizeOpCommon(
   }
 
   return verifyQuantizeOpCommon([&]() { return emitOpError(); },
-                                getInput().getType(), getOutput().getType());
+                                getInput().getType(), getOutput().getType(),
+                                /*axis=*/std::nullopt, /*isUnrolled=*/false);
+}
+
+// DequantizeUnrolledOp verification.
+::mlir::LogicalResult mlir::tt::ttir::DequantizeUnrolledOp::verify() {
+  RankedTensorType inputTensorType = getInput().getType();
+  RankedTensorType outputTensorType = getResult().getType();
+
+  auto inputElemType = inputTensorType.getElementType();
+  auto outputElemType = outputTensorType.getElementType();
+
+  if (!mlir::isa<mlir::quant::UniformQuantizedType,
+                 mlir::quant::UniformQuantizedPerAxisType>(inputElemType)) {
+    return emitOpError() << "Input element type must be UniformQuantizedType "
+                            "or UniformQuantizedPerAxisType, but got "
+                         << inputElemType;
+  }
+
+  if (!mlir::isa<mlir::FloatType>(outputElemType)) {
+    return emitOpError() << "Output element type must be float, but got "
+                         << outputElemType;
+  }
+
+  return verifyQuantizeOpCommon([&]() { return emitOpError(); },
+                                inputTensorType, outputTensorType, getAxis(),
+                                /*isUnrolled=*/true);
 }
 
 // RequantizeOp verification.
@@ -720,7 +840,35 @@ static ::mlir::LogicalResult verifyQuantizeOpCommon(
   }
 
   return verifyQuantizeOpCommon([&]() { return emitOpError(); },
-                                getInput().getType(), getOutput().getType());
+                                getInput().getType(), getOutput().getType(),
+                                /*axis=*/std::nullopt, /*isUnrolled=*/false);
+}
+
+// RequantizeUnrolledOp verification.
+::mlir::LogicalResult mlir::tt::ttir::RequantizeUnrolledOp::verify() {
+  auto inputElemType = getInput().getType().getElementType();
+  auto outputElemType = getResult().getType().getElementType();
+
+  auto inputIsPerAxis =
+      mlir::isa<mlir::quant::UniformQuantizedPerAxisType>(inputElemType);
+  auto outputIsPerAxis =
+      mlir::isa<mlir::quant::UniformQuantizedPerAxisType>(outputElemType);
+  auto inputIsPerTensor =
+      mlir::isa<mlir::quant::UniformQuantizedType>(inputElemType);
+  auto outputIsPerTensor =
+      mlir::isa<mlir::quant::UniformQuantizedType>(outputElemType);
+
+  if (!((inputIsPerAxis && outputIsPerAxis) ||
+        (inputIsPerTensor && outputIsPerTensor))) {
+    return emitOpError()
+           << "Input and output element types must both be per-axis "
+              "or both be per-tensor quantized types, but got "
+           << inputElemType << " and " << outputElemType;
+  }
+
+  return verifyQuantizeOpCommon([&]() { return emitOpError(); },
+                                getInput().getType(), getOutput().getType(),
+                                /*axis=*/getAxis(), /*isUnrolled=*/true);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1821,6 +1969,52 @@ mlir::OpFoldResult mlir::tt::ttir::TypecastOp::fold(FoldAdaptor adaptor) {
   return {};
 }
 
+static bool isNarrowingConversion(const ::mlir::tt::DataType srcDtype,
+                                  const ::mlir::tt::DataType dstDtype) {
+  const bool srcIsFloat = isFloat(srcDtype);
+  const bool dstIsFloat = isFloat(dstDtype);
+  const auto srcNumberOfBits = getNumberOfBits(srcDtype);
+  const auto dstNumberOfBits = getNumberOfBits(dstDtype);
+
+  if (srcIsFloat && !dstIsFloat) {
+    return true;
+  }
+
+  if (srcIsFloat && dstIsFloat) {
+    const auto srcExponentSize = getExponentSize(srcDtype);
+    const auto dstExponentSize = getExponentSize(dstDtype);
+    const auto srcMantissaSize = getMantissaSize(srcDtype);
+    const auto dstMantissaSize = getMantissaSize(dstDtype);
+    return srcExponentSize > dstExponentSize ||
+           srcMantissaSize > dstMantissaSize;
+  }
+
+  // For integer to FP, it is narrowing if the FP type has fewer bits in its
+  // mantissa than the integer type's magnitude bits.
+  if (!srcIsFloat && dstIsFloat) {
+    if (isSignedInteger(srcDtype)) {
+      return srcNumberOfBits - 1 > getMantissaSize(dstDtype);
+    }
+    return srcNumberOfBits > getMantissaSize(dstDtype);
+  }
+
+  assert(!srcIsFloat && !dstIsFloat);
+  const auto srcIsSigned = isSignedInteger(srcDtype);
+  const auto dstIsSigned = isSignedInteger(dstDtype);
+  // When signedness are the same, reducing the number of bits is narrowing.
+  if (srcIsSigned == dstIsSigned) {
+    return srcNumberOfBits > dstNumberOfBits;
+  }
+  // Unsigned->Signed is narrowing when the signed type can't hold the largest.
+  // value of the unsigned type
+  if (!srcIsSigned && dstIsSigned) {
+    return srcNumberOfBits >= dstNumberOfBits;
+  }
+  // Signed->Unsigned is always narrowing.
+  assert(srcIsSigned && !dstIsSigned);
+  return true;
+}
+
 // TypecastOp canonicalization method
 ::llvm::LogicalResult
 mlir::tt::ttir::TypecastOp::canonicalize(mlir::tt::ttir::TypecastOp op,
@@ -1833,8 +2027,37 @@ mlir::tt::ttir::TypecastOp::canonicalize(mlir::tt::ttir::TypecastOp op,
     return mlir::failure();
   }
 
+  const bool conservativeFolding =
+      op.getConservativeFolding() || producerOp.getConservativeFolding();
+
+  if (conservativeFolding) {
+    // Disable folding if it has the potential to cause too much numerical
+    // differences.
+    auto dtypeIn =
+        elementTypeToDataType(producerOp.getInput().getType().getElementType());
+    auto dtypeMid =
+        elementTypeToDataType(op.getInput().getType().getElementType());
+    auto dtypeOut = elementTypeToDataType(op.getType().getElementType());
+
+    assert(dtypeMid ==
+           elementTypeToDataType(producerOp.getType().getElementType()));
+
+    // If the 1st Op is narrowing and the 2nd Op is widening, we shouldn't fold.
+    // FP->Int->FP is special and should never fold, due to its truncation
+    // semantics and application in QDQ models.
+    const bool isNarrowingProducer = isNarrowingConversion(dtypeIn, dtypeMid);
+    const bool isNarrowingConsumer = isNarrowingConversion(dtypeMid, dtypeOut);
+    const bool isFpIntFp =
+        isFloat(dtypeIn) && !isFloat(dtypeMid) && isFloat(dtypeOut);
+    if (isFpIntFp || (isNarrowingProducer && !isNarrowingConsumer)) {
+      return mlir::failure();
+    }
+  }
+
+  // The resulting Op is conservative iff both typecast ops were conservative.
   ttir::utils::replaceOpWithNewDPSOp<ttir::TypecastOp>(
-      rewriter, op, op.getType(), producerOp.getInput());
+      rewriter, op, op.getType(), producerOp.getInput(),
+      op.getConservativeFolding() && producerOp.getConservativeFolding());
 
   return mlir::success();
 }
@@ -3413,6 +3636,47 @@ mlir::LogicalResult mlir::tt::ttir::FullOp::verify() {
   }
 
   return mlir::success();
+}
+
+bool mlir::tt::ttir::FullOp::bufferizesToMemoryRead(
+    mlir::OpOperand &, const mlir::bufferization::AnalysisState &) {
+  return false;
+}
+
+bool mlir::tt::ttir::FullOp::bufferizesToMemoryWrite(
+    mlir::OpOperand &, const mlir::bufferization::AnalysisState &) {
+  return false;
+}
+
+mlir::LogicalResult mlir::tt::ttir::FullOp::bufferize(
+    mlir::RewriterBase &rewriter,
+    const mlir::bufferization::BufferizationOptions &options) {
+  ::llvm::SmallVector<mlir::Value> invocationStack;
+  auto memrefType = mlir::cast<mlir::MemRefType>(
+      getBufferType(getResult(), options, invocationStack).value());
+
+  auto denseAttr =
+      mlir::DenseElementsAttr::get(getResult().getType(), getFillValueAttr());
+
+  mlir::memref::GlobalOp global = createGlobal(
+      getOperation()->getParentOfType<ModuleOp>(), memrefType, denseAttr);
+  mlir::bufferization::replaceOpWithNewBufferizedOp<memref::GetGlobalOp>(
+      rewriter, *this, global.getType(), global.getName());
+
+  return mlir::success();
+}
+
+mlir::bufferization::AliasingValueList
+mlir::tt::ttir::FullOp::getAliasingValues(
+    mlir::OpOperand &, const mlir::bufferization::AnalysisState &) {
+  bufferization::AliasingValueList result;
+  return result;
+}
+
+mlir::FailureOr<mlir::BaseMemRefType> mlir::tt::ttir::FullOp::getBufferType(
+    mlir::Value value, const mlir::bufferization::BufferizationOptions &,
+    ::llvm::SmallVector<mlir::Value> &) {
+  return mlir::tt::ttir::getBufferType(value.getType(), /*isView=*/false);
 }
 
 //===----------------------------------------------------------------------===//
